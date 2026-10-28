@@ -14,7 +14,7 @@ export function WorkspaceChrome({ title, onOpen, onNavigate, navigationOpen, onT
       <strong className="calm-brand">open<span>takeoff</span></strong>
       <div className="calm-project" title={title}><span>{title || "Untitled workspace"}</span><small>Premium workspace</small></div>
       <div className="calm-header-actions">
-        <button type="button" onClick={onOpen} title="Open plans"><Icon name="plus" size={16} /><span>Open</span></button>
+        {onOpen && <button type="button" onClick={onOpen} title="Open plans"><Icon name="plus" size={16} /><span>Open</span></button>}
         {fileMenu}
         <button type="button" aria-pressed={navigationOpen} onClick={onNavigate}><Icon name="sheets" size={16} />Sheets</button>
         {pinControl}

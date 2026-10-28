@@ -474,6 +474,8 @@ function WorkspaceGate() {
   return pick === "m365" ? <M365Gate cfg={cfg} /> : <FolderGate />;
 }
 
+const EMBED_NOTICE_H = 22;   // px reserved under the canvas for the legal strip
+
 // Inside Helm OS (?embed=helm): no project home, no Google/365/folder gates — the parent page owns the project.
 function EmbedApp() {
   const [st, setSt] = useState({ ready: false, error: "" });
@@ -488,12 +490,17 @@ function EmbedApp() {
   if (!st.ready) return <Centered title="Opening the plans…" />;
   return (
     <>
+      {/* The canvas shell is 100vh; shorten it so the legal strip below sits under it and overlaps nothing. */}
+      <style>{`.app-shell { height: calc(100vh - ${EMBED_NOTICE_H}px) !important; }`}</style>
       <TakeoffCanvas />
-      {/* NOTICE §7(b) attribution + the AGPL source offer, always on screen in the embed. */}
-      <a href="https://github.com/Roofweiler-llc/opentakeoff" target="_blank" rel="noreferrer"
-         style={{ position: "fixed", right: 8, bottom: 6, fontSize: 11, color: "var(--ink-muted)", zIndex: 5 }}>
-        OpenTakeoff, an open project by Kentucky AI (opentakeoff.kentucky-ai.com) · source
-      </a>
+      {/* NOTICE §7(b) attribution (verbatim) + the AGPL source offer, always on screen in the embed. Fixed dark colors, like the
+          canvas status bar above it: the workspace look variables are not in scope out here. */}
+      <footer style={{ position: "fixed", left: 0, right: 0, bottom: 0, height: EMBED_NOTICE_H, display: "flex", alignItems: "center", justifyContent: "center", gap: 8,
+        fontSize: 11, lineHeight: 1, color: "#a0a69f", background: "#111415", borderTop: "1px solid #2f3739", zIndex: 1 }}>
+        <span>OpenTakeoff, an open project by Kentucky AI (<a href="https://opentakeoff.kentucky-ai.com" target="_blank" rel="noreferrer" style={{ color: "inherit" }}>https://opentakeoff.kentucky-ai.com</a>)</span>
+        <span aria-hidden="true">·</span>
+        <a href="https://github.com/Roofweiler-llc/opentakeoff" target="_blank" rel="noreferrer" style={{ color: "inherit" }}>AGPL-3.0 source</a>
+      </footer>
     </>
   );
 }
@@ -519,7 +526,8 @@ function App() {
 ReactDOM.createRoot(document.getElementById("root")).render(
   <React.StrictMode>
     {isHelmEmbed() ? (
-      <BrowserRouter basename="/takeoff-canvas"><EmbedApp /></BrowserRouter>
+      // TakeoffCanvas and PlanNavigator call useGoogleAuth(), which throws without a provider (a no-op with no client id)
+      <GoogleAuthProvider><BrowserRouter basename="/takeoff-canvas"><EmbedApp /></BrowserRouter></GoogleAuthProvider>
     ) : (
       <GoogleAuthProvider>
         <BrowserRouter basename="/takeoff-canvas">

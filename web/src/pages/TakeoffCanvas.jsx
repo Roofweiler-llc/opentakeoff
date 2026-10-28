@@ -111,6 +111,8 @@ import { traceConfidence, floodSignals } from "../lib/confidence";
 // The scale-acceptance ruler (a calibrated bar drawn on the sheet after a scale
 // is set) — the owner's call, 2026-08-24: it serves no purpose on the sheet.
 const SHOW_SCALE_GUIDE = false;
+// Inside Helm OS (?embed=helm) the plans belong to the bid, not this browser: every add / remove / clear control is hidden.
+const HELM_EMBED = isHelmEmbed();
 // net engine runs in a worker: a dense sheet's build is 30-90 s of pure
 // geometry and must never block the page (measured: "Page Unresponsive"
 // on Comfort Inn when it ran on the main thread)
@@ -189,6 +191,7 @@ import AccountChip from "../components/AccountChip.jsx";
 import PresenceChip from "../components/PresenceChip.jsx";
 import { StylePreview } from "../components/DrawStylePicker.jsx";
 import { useGoogleAuth } from "../lib/google/AuthContext.jsx";
+import { isHelmEmbed } from "../lib/embedStore.js";
 import { projectHomeFolderId } from "../lib/projectHome.js";
 import { getTheme, toggleTheme, onThemeChange } from "../lib/theme.js";
 // Pure data constants (render/zoom budgets, snap tuning, tool descriptors,
@@ -2051,6 +2054,7 @@ export default function TakeoffCanvas() {
   async function handleFiles(fileList) {
     const incoming = Array.from(fileList || []);
     if (!incoming.length) return;
+    if (HELM_EMBED) { setCommitMsg("Plans are managed on the bid in Helm OS — add them there."); return; }
     // a dropped .otk is a PROJECT, not a plan — it replaces the workspace
     // (snapshot first) instead of joining the plan set (#300)
     const otk = incoming.find((f) => isProjectArchive(f.name));
@@ -10331,7 +10335,7 @@ export default function TakeoffCanvas() {
           menus open position:fixed off the trigger rect (ToolMenu) so this
           overflow cannot clip them. */}
       {!focusMode && workspaceLayout && <WorkspaceChrome
-        title={projectName || active} onOpen={() => fileInputRef.current?.click()}
+        title={projectName || active} onOpen={HELM_EMBED ? undefined : () => fileInputRef.current?.click()}
         onNavigate={() => setWorkspaceNavigationOpen((v) => !v)} navigationOpen={workspaceNavigationOpen}
         onTakeoffs={toggleTakeoffs} takeoffsOpen={takeoffsOpen} onWork={() => setAgentOpen((v) => !v)} workOpen={agentOpen} workButtonRef={workButtonRef}
         pending={shapes.filter((shape) => shape.origin?.reviewed === false).length} running={agentRunning}
@@ -10375,9 +10379,9 @@ export default function TakeoffCanvas() {
             keeps the cluster captions (top:-13) inside the scroll box. */}
         <div data-topbar-scroll style={{ display: "flex", gap: 7, alignItems: "center", flex: "1 1 0", minWidth: 0, padding: "16px 0 0", overflowX: "auto", overflowY: "hidden", scrollbarWidth: "thin", overscrollBehaviorX: "contain" }}>
         <strong style={{ fontFamily: "var(--f-display)", fontSize: 15, color: "var(--ink)", letterSpacing: "-0.02em" }}>open<span style={{ fontStyle: "italic", color: "var(--cobalt)" }}>takeoff</span></strong>
-        <button type="button" onClick={() => fileInputRef.current?.click()} title="Open plans — PDF, image, or a .zip plan set (or just drag them onto the canvas)"
+        {!HELM_EMBED && <button type="button" onClick={() => fileInputRef.current?.click()} title="Open plans — PDF, image, or a .zip plan set (or just drag them onto the canvas)"
           style={{ display: "inline-flex", alignItems: "center", gap: 6, padding: "6px 10px", border: "1px solid var(--ink)", background: "var(--ink)", color: "var(--paper-bright)", cursor: "pointer", fontWeight: 600, fontSize: 12.5, lineHeight: 1 }}>
-          <Icon name="plus" size={14} />Open</button>
+          <Icon name="plus" size={14} />Open</button>}
         <button type="button" onClick={() => setView("gallery")}
           title={`Plan set — the visual gallery; open one or several sheets (G)${sheetGroup.length ? ` · ${sheetGroup.length} side-by-side now` : ""}`}
           style={{ display: "inline-flex", alignItems: "center", gap: 6, padding: "6px 10px", border: `1px solid ${sheetGroup.length ? "var(--cobalt)" : "var(--ink-faint)"}`, background: sheetGroup.length ? "var(--cobalt)" : "transparent", color: sheetGroup.length ? "var(--paper-bright)" : "var(--ink)", cursor: "pointer", fontWeight: 600, fontSize: 12.5, lineHeight: 1 }}>
@@ -11335,16 +11339,16 @@ export default function TakeoffCanvas() {
           ocr={ocrApi}
           openTabs={openTabs} onOpen={openSheets}
           stitches={stitches} onStitch={createStitch} onOpenStitch={openStitch} onDeleteStitch={deleteStitch}
-          onAddFiles={handleFiles}
+          onAddFiles={HELM_EMBED ? undefined : handleFiles}
           levels={sheetLevels}
           onAssignLevel={(keys, label) => setSheetLevels((m) => {
             const next = { ...m };
             for (const k of keys) { if (label) next[k] = label; else delete next[k]; }
             return next;
           })}
-          onClosePdf={closePdf}
-          onCloseMany={closePdfs}
-          onClearWorkspace={cloudMode ? undefined : clearWorkspace}
+          onClosePdf={HELM_EMBED ? undefined : closePdf}
+          onCloseMany={HELM_EMBED ? undefined : closePdfs}
+          onClearWorkspace={cloudMode || HELM_EMBED ? undefined : clearWorkspace}
           knownPages={knownPages} onPages={rememberPages}
           onRemoveFromProject={cloudMode ? removeFromProject : undefined}
           onCloseProject={cloudMode ? closeProject : undefined}

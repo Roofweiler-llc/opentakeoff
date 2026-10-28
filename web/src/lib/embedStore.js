@@ -2,7 +2,7 @@
 // project lives in Helm OS, not in this browser: the sheet list and the saved takeoff come from the parent page,
 // each PDF is fetched from a short-lived link the parent signs, and every autosave is posted back to the parent.
 // Everything else (templates, material/stamp libraries, snapshots) stays in this browser's local store.
-import { localStore } from "./store.js";
+import { localStore, emptyAnnotations, ANN_SCHEMA } from "./store.js";
 
 const PARENT = window.location.origin;   // same-origin embed only — a foreign parent is never answered
 let seq = 0;
@@ -32,7 +32,7 @@ function ask(type, payload = {}) {
   });
 }
 
-/** { sheets: string[], doc: takeoff_canvas.v1 } from the parent. */
+/** { sheets: string[], doc: takeoff_canvas.v1 | null, project: string } from the parent. */
 export const embedInit = () => ask("ot:hello");
 
 export function createEmbedStore(init) {
@@ -45,8 +45,15 @@ export function createEmbedStore(init) {
     if (!r.ok) throw new Error(`Couldn't load ${name} (${r.status}) — try again.`);
     return new Uint8Array(await r.arrayBuffer());
   };
-  s.loadAnnotations = async () => (init?.doc && typeof init.doc === "object" ? init.doc : localStore.loadAnnotations());
-  s.saveAnnotations = async (payload) => { window.parent.postMessage({ type: "ot:save", doc: payload }, PARENT); };
+  // A bid with no saved takeoff starts EMPTY — never from this browser's global local key, which could hold another bid's.
+  s.loadAnnotations = async () => (init?.doc && typeof init.doc === "object" ? init.doc : emptyAnnotations());
+  // Same shape localStore writes ({ ...payload, schema }) — the Helm OS server rejects a doc without the schema.
+  s.saveAnnotations = async (payload) => { window.parent.postMessage({ type: "ot:save", doc: { ...payload, schema: ANN_SCHEMA } }, PARENT); };
+  // Revisions are kept per bid in this browser's snapshot store, never shared across bids. (deleteSnapshot is by unique id.)
+  const project = init?.project ? String(init.project) : "helm:unknown";
+  s.saveSnapshot = (label, payload) => localStore.saveSnapshot(label, payload, project);
+  s.listSnapshots = () => localStore.listSnapshots(project);
+  s.getSnapshot = (id) => localStore.getSnapshot(id, project);
   s.addPdf = async () => { throw new Error("Add plans to the bid in Helm OS — they show up here."); };
   s.removePdf = async () => { throw new Error("Plans are managed on the bid in Helm OS."); };
   return s;
