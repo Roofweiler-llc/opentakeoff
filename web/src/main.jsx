@@ -9,6 +9,7 @@ import TakeoffCanvas from "./pages/TakeoffCanvas.jsx";
 import ProjectHome from "./components/ProjectHome.jsx";
 import { GoogleAuthProvider, useGoogleAuth } from "./lib/google/AuthContext.jsx";
 import { projectIdFromUrl, setActiveStore, metaGet, metaDelete } from "./lib/store.js";
+import { createEmbedStore, embedInit, isHelmEmbed } from "./lib/embedStore.js";
 import { isGoogleConfigured, getAccessToken } from "./lib/google/auth.js";
 import { loadFolderLink, queryFolderPermission, requestFolderPermission, forgetFolder } from "./lib/fs/fsAccess.js";
 import { m365Config, M365_ENABLED_KEY } from "./lib/msgraph/config.js";
@@ -473,6 +474,30 @@ function WorkspaceGate() {
   return pick === "m365" ? <M365Gate cfg={cfg} /> : <FolderGate />;
 }
 
+// Inside Helm OS (?embed=helm): no project home, no Google/365/folder gates — the parent page owns the project.
+function EmbedApp() {
+  const [st, setSt] = useState({ ready: false, error: "" });
+  useEffect(() => {
+    let live = true;
+    embedInit()
+      .then((init) => { if (!live) return; setActiveStore(createEmbedStore(init)); setSt({ ready: true, error: "" }); })
+      .catch((e) => { if (live) setSt({ ready: false, error: String(e?.message || e) }); });
+    return () => { live = false; };
+  }, []);
+  if (st.error) return <Centered title="Couldn't open the plans" body={st.error} />;
+  if (!st.ready) return <Centered title="Opening the plans…" />;
+  return (
+    <>
+      <TakeoffCanvas />
+      {/* NOTICE §7(b) attribution + the AGPL source offer, always on screen in the embed. */}
+      <a href="https://github.com/Roofweiler-llc/opentakeoff" target="_blank" rel="noreferrer"
+         style={{ position: "fixed", right: 8, bottom: 6, fontSize: 11, color: "var(--ink-muted)", zIndex: 5 }}>
+        OpenTakeoff, an open project by Kentucky AI (opentakeoff.kentucky-ai.com) · source
+      </a>
+    </>
+  );
+}
+
 function App() {
   // Subscribe to navigation: react-router bails out of re-rendering the same
   // element on navigate(), so App must watch the location itself. The store.js
@@ -493,13 +518,17 @@ function App() {
 
 ReactDOM.createRoot(document.getElementById("root")).render(
   <React.StrictMode>
-    <GoogleAuthProvider>
-      <BrowserRouter>
-        <Routes>
-          <Route path="/projects" element={<ProjectHomeGate />} />
-          <Route path="*" element={<App />} />
-        </Routes>
-      </BrowserRouter>
-    </GoogleAuthProvider>
+    {isHelmEmbed() ? (
+      <BrowserRouter basename="/takeoff-canvas"><EmbedApp /></BrowserRouter>
+    ) : (
+      <GoogleAuthProvider>
+        <BrowserRouter basename="/takeoff-canvas">
+          <Routes>
+            <Route path="/projects" element={<ProjectHomeGate />} />
+            <Route path="*" element={<App />} />
+          </Routes>
+        </BrowserRouter>
+      </GoogleAuthProvider>
+    )}
   </React.StrictMode>
 );

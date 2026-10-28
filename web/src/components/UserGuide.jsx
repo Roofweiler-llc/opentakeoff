@@ -181,8 +181,8 @@ export default function UserGuide({ onClose, onTour, onConnect }) {
         )}
 
         <nav aria-label="Legal" style={{ display: "flex", gap: 16, marginBottom: 22, fontSize: 12.5 }}>
-          <a href="/privacy/" target="_blank" rel="noreferrer">Privacy Policy</a>
-          <a href="/terms/" target="_blank" rel="noreferrer">Terms of Service</a>
+          <a href={`${import.meta.env?.BASE_URL || "/"}privacy/`} target="_blank" rel="noreferrer">Privacy Policy</a>
+          <a href={`${import.meta.env?.BASE_URL || "/"}terms/`} target="_blank" rel="noreferrer">Terms of Service</a>
         </nav>
 
         <Section title="Five minutes to a takeoff">

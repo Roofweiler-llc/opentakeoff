@@ -17,6 +17,7 @@ const pkg = JSON.parse(readFileSync(new URL("./package.json", import.meta.url), 
 // model AI sandbox in `../server` (see server/README.md). Without it, the app
 // works fully; the AI hooks just stay dormant.
 export default defineConfig({
+  base: "/takeoff-canvas/",
   plugins: [react()],
   define: { __APP_VERSION__: JSON.stringify(pkg.version) },
   // On-device OCR (#469): ppu-paddle-ocr imports the bare `onnxruntime-web`,
