@@ -3,6 +3,7 @@
 // each PDF is fetched from a short-lived link the parent signs, and every autosave is posted back to the parent.
 // Everything else (templates, material/stamp libraries, snapshots) stays in this browser's local store.
 import { localStore, emptyAnnotations, ANN_SCHEMA } from "./store.js";
+import { cleanHelmCommand } from "./helmCommands.js";
 
 const PARENT = window.location.origin;   // same-origin embed only — a foreign parent is never answered
 let seq = 0;
@@ -13,9 +14,30 @@ export const isHelmEmbed = () => {
   catch { return false; }
 };
 
+/** Simple mode (?embed=helm&simple=1, 2026-11-01): the canvas's own chrome is hidden — Helm OS shows a plain toolbar
+ *  above the plan and drives the canvas with commands (helmCommands.js); the canvas reports its state back. */
+export const isHelmSimple = () => {
+  try { return isHelmEmbed() && new URLSearchParams(window.location.search).get("simple") === "1"; }
+  catch { return false; }
+};
+
+let onCommand = null;
+/** The canvas registers its command handler here; returns the unsubscribe. One handler — the mounted canvas. */
+export function onHelmCommand(fn) {
+  onCommand = fn;
+  return () => { if (onCommand === fn) onCommand = null; };
+}
+
+/** What the canvas tells the parent's toolbar: the tool, condition, zoom, scale, selection and totals. */
+export function postHelmState(state) {
+  if (isHelmEmbed()) window.parent.postMessage({ type: "ot:state", state }, PARENT);
+}
+
 window.addEventListener("message", (e) => {
   if (e.origin !== PARENT || e.source !== window.parent) return;
   const m = e.data;
+  const c = cleanHelmCommand(m);
+  if (c) { onCommand?.(c.cmd, c.value); return; }
   if (m?.type !== "helm:reply" || !waiting.has(m.id)) return;
   const { resolve, reject, timer } = waiting.get(m.id);
   waiting.delete(m.id);

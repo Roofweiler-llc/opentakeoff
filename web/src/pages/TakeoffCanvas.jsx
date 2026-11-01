@@ -113,6 +113,11 @@ import { traceConfidence, floodSignals } from "../lib/confidence";
 const SHOW_SCALE_GUIDE = false;
 // Inside Helm OS (?embed=helm) the plans belong to the bid, not this browser: every add / remove / clear control is hidden.
 const HELM_EMBED = isHelmEmbed();
+// Helm OS simple mode (?embed=helm&simple=1, 2026-11-01): the pro chrome is hidden — Helm OS's own toolbar above the plan
+// picks the tool, the condition, the zoom and the scale through postMessage commands (lib/helmCommands.js), and reads the
+// canvas's state back. Kept: the plan, the sheet tabs, the drawing itself, the calibrate prompt, the status line and the
+// AGPL attribution + source link (main.jsx EmbedApp).
+const HELM_SIMPLE = isHelmSimple();
 // net engine runs in a worker: a dense sheet's build is 30-90 s of pure
 // geometry and must never block the page (measured: "Page Unresponsive"
 // on Comfort Inn when it ran on the main thread)
@@ -191,7 +196,7 @@ import AccountChip from "../components/AccountChip.jsx";
 import PresenceChip from "../components/PresenceChip.jsx";
 import { StylePreview } from "../components/DrawStylePicker.jsx";
 import { useGoogleAuth } from "../lib/google/AuthContext.jsx";
-import { isHelmEmbed } from "../lib/embedStore.js";
+import { isHelmEmbed, isHelmSimple, onHelmCommand, postHelmState } from "../lib/embedStore.js";
 import { projectHomeFolderId } from "../lib/projectHome.js";
 import { getTheme, toggleTheme, onThemeChange } from "../lib/theme.js";
 // Pure data constants (render/zoom budgets, snap tuning, tool descriptors,
@@ -9259,6 +9264,97 @@ export default function TakeoffCanvas() {
     ...workspaceSheets.map((sheet) => ({ id: `sheet-${sheet.key}`, label: sheet.label, group: sheet.file, run: () => openSheets([sheet.key], false) })),
   ];
 
+  // ── Helm OS commands + state (2026-11-01) ─────────────────────────────────
+  // The parent's toolbar sends a closed set of commands (lib/helmCommands.js validated it, same-origin parent only);
+  // each one reuses the action the canvas's own control runs. The handler is re-pointed every render so it always sees
+  // live state; the subscription is made once.
+  const helmCommandRef = useRef(null);
+  helmCommandRef.current = (cmd, value) => {
+    const key = focusPanel?.key;
+    const byId = (id) => shapes.find((s) => s.id === id);
+    switch (cmd) {
+      case "tool": setView("canvas"); setTool(value === "line" ? "linear" : value); break;
+      case "condition": if (condById[value]) activateCondition(value, { reassign: false }); break;
+      case "zoom": {
+        if (value === "fit") { if (stage.w) fitToView(stage.w, stage.h); break; }
+        const r = containerRef.current?.getBoundingClientRect();
+        if (r) zoomAround(r.width / 2, r.height / 2, value === "in" ? 1.4 : 1 / 1.4);
+        break;
+      }
+      case "undo": if (poly.length) dropLastPoint(); else undoShapeCommand(); break;
+      case "redo": redoShapeCommand(); break;
+      case "finish": if (finishOk) finishShape(); break;
+      case "sheets": setView("gallery"); break;
+      case "scale": {
+        if (!key) break;
+        // The scale menu's own rows: the plan's printed scale, or a standard one.
+        const det = detectedScales[key];
+        const pick = value === "detected" ? (det ? { upp: det.upp, label: det.label, source: "detected" } : null)
+          : (() => { const s = STANDARD_SCALES.find((x) => x.label === value); return s ? { upp: s.upp, label: s.label, source: "standard" } : null; })();
+        if (!pick) break;
+        rescaleSheet(key, pick.upp);
+        setScaleSources((sc) => ({ ...sc, [key]: pick.source }));
+        showScaleGuide(key, pick.upp, pick.label);
+        break;
+      }
+      case "accept": {
+        const s = byId(value);
+        if (s?.origin?.reviewed !== false) break;
+        dispatchShape({ type: "review", ids: [s.id] });
+        setCommitMsg(`Accepted 1 ${condById[s.condition_id]?.finish_tag || "shape"} (⌘Z undoes).`);
+        break;
+      }
+      case "reject": {
+        const s = byId(value);
+        if (s?.origin?.actor !== "agent") break;   // only an agent's suggestion is rejected this way; a person's shape is deleted with Select
+        dispatchShape({ type: "delete", ids: [s.id], reason: "proposal-reject" });
+        if (selectedId === s.id) setSelectedId(null);
+        setCommitMsg(`Removed 1 suggested ${condById[s.condition_id]?.finish_tag || "shape"} (⌘Z restores).`);
+        break;
+      }
+      case "show": {
+        const s = byId(value);
+        if (!s) break;
+        // A single point (a count) on an open sheet: centered at a working zoom, so what's around it shows too —
+        // locateWork frames a lone point at full magnification. Anything else (or a sheet not open yet): locateWork.
+        const sp = panelKeySet.has(s.sheet_id) ? panelByKey(s.sheet_id) : null;
+        const pt = Array.isArray(s.verts_norm) && s.verts_norm.length === 1 ? s.verts_norm[0] : null;
+        const r = containerRef.current?.getBoundingClientRect();
+        if (sp?.img?.w && pt && r) {
+          const scale = clamp(Math.max(tfRef.current.scale, 0.55));
+          setTfNow({ x: r.width / 2 - (pt[0] * sp.img.w + sp.xOffset) * scale, y: r.height / 2 - pt[1] * sp.img.h * scale, scale });
+          setTool("select"); setSelectedId(s.id); setSelectedMarkupId(null);
+        } else locateWork(s);
+        break;
+      }
+      default: break;
+    }
+  };
+  useEffect(() => (HELM_EMBED ? onHelmCommand((cmd, value) => helmCommandRef.current?.(cmd, value)) : undefined), []);
+  // What the parent's toolbar shows: per condition, what's accepted (an agent's unaccepted suggestions counted apart),
+  // and how much of it a person made.
+  const helmState = useMemo(() => {
+    if (!HELM_EMBED) return null;
+    const kept = shapes.filter((s) => s.origin?.reviewed !== false);
+    const totals = {};
+    for (const t of conditionTotals(conditions, kept)) totals[t.id] = { sf: t.total_sf, lf: t.lf, ea: t.ea, n: t.shape_count, pending: 0, mine: 0 };
+    for (const s of shapes) {
+      const t = totals[s.condition_id];
+      if (!t) continue;
+      if (s.origin?.reviewed === false) t.pending++;
+      else if (s.origin?.actor !== "agent") t.mine++;
+    }
+    return {
+      v: 1, view, tool, condition: activeCond || null,
+      conditions: conditions.map((c) => ({ id: c.id, tag: c.finish_tag, color: c.color })),
+      totals, zoom: Math.round(tf.scale * 1000) / 1000, sheet: focusPanel?.key ?? null,
+      scale: { set: !!unitsPerPx, label: unitsPerPx ? stdValue || "custom" : null, detected: scaleDet?.label ?? null, confirm: scaleNeedsConfirm },
+      scales: STANDARD_SCALES.filter((s) => !s.label.startsWith("1:")).map((s) => s.label),
+      selected: selectedId, drawing: poly.length, canFinish: !!finishOk,
+    };
+  }, [view, tool, activeCond, conditions, shapes, tf.scale, focusPanel?.key, unitsPerPx, stdValue, scaleDet, scaleNeedsConfirm, selectedId, poly.length, finishOk]);
+  useEffect(() => { if (helmState) postHelmState(helmState); }, [helmState]);
+
   // ?hatchqa — density-tuning wall: every pattern at three scales in two palette
   // colors, real components, dark-aware. Unreachable from the UI; kept for retunes.
   // Added 2026-07-07 (d02032a) and lost, not removed, in the fork merge 1317d07
@@ -9936,7 +10032,7 @@ export default function TakeoffCanvas() {
               Space presses still bubble so a pan can start on top, and dblclick
               is stopped so rapid clicks can't finishShape() */}
           <div onPointerDown={(e) => { if (e.button === 0 && !spaceRef.current) e.stopPropagation(); }} onDoubleClick={(e) => e.stopPropagation()}
-            style={{ position: "absolute", left: 14, bottom: 14, display: "flex", flexDirection: "column", gap: 6 }}>
+            style={{ position: "absolute", left: 14, bottom: 14, display: HELM_SIMPLE ? "none" : "flex", flexDirection: "column", gap: 6 }}>
             <button onClick={() => stage.w && fitToView(stage.w, stage.h)} title="Fit sheet to view" style={{ width: 34, height: 34, borderRadius: 0, border: "1px solid var(--ink-faint)", background: "var(--paper-bright)", cursor: "pointer", fontSize: 12 }}>fit</button>
             <button onClick={() => setDarkMode((d) => !d)} title={darkMode ? "Sheet back to positive print" : "Invert sheet — negative print (affects marked-set export)"}
               style={{ width: 34, height: 34, borderRadius: 0, border: `1px solid ${darkMode ? "var(--cobalt)" : "var(--ink-faint)"}`, background: darkMode ? "var(--cobalt)" : "var(--paper-bright)", color: darkMode ? "var(--paper-bright)" : "var(--ink)", cursor: "pointer", fontSize: 13 }}>
@@ -9952,7 +10048,7 @@ export default function TakeoffCanvas() {
               Cancel row for a read still running on a sheet that left the
               screen. Same press handling as the cluster. */}
           <div onPointerDown={(e) => { if (e.button === 0 && !spaceRef.current) e.stopPropagation(); }} onDoubleClick={(e) => e.stopPropagation()}
-            style={{ ...readControlPlacement({ bannerHeight: ruleBannerH }), zIndex: Z.canvasUi, maxWidth: `calc(100% - ${READ_CONTROL_LEFT + CANVAS_EDGE}px)` }}>
+            style={{ ...readControlPlacement({ bannerHeight: ruleBannerH }), zIndex: Z.canvasUi, maxWidth: `calc(100% - ${READ_CONTROL_LEFT + CANVAS_EDGE}px)`, ...(HELM_SIMPLE ? { display: "none" } : {}) }}>
             <PageReadControl
               rows={[
                 ...panels.filter((p) => !isStitchKey(p.key)).map((p) => ({
@@ -10001,7 +10097,7 @@ export default function TakeoffCanvas() {
         )}
         {/* top-center stack: accept pill + dictation chip share one flex column
             so simultaneous voice + pending proposals can never overlap. */}
-        {(voiceChip || pendingCommitted.length > 0) && (
+        {(voiceChip || (pendingCommitted.length > 0 && !HELM_SIMPLE)) && (
         <div style={{ position: "absolute", left: "50%", top: 12, transform: "translateX(-50%)", zIndex: Z.canvasUi, display: "flex", flexDirection: "column", alignItems: "center", gap: 6, pointerEvents: "none" }}>
         {/* accept pill — visible while committed-but-unreviewed shapes (an
             imported MCP takeoff) are on the visible sheets; they render dashed
@@ -10009,7 +10105,7 @@ export default function TakeoffCanvas() {
         {/* proposals (#365): one pill per BATCH. A forty-room detect run the
             agent proposed under one label is one Accept and one Reject, not
             forty; un-batched pending shapes keep the original pill. */}
-        {pendingGroups.map((g) => {
+        {!HELM_SIMPLE && pendingGroups.map((g) => {
           const n = g.ids.length;
           const label = g.proposal ? g.proposal.label : `${n} proposed shape${n === 1 ? "" : "s"}`;
           const key = g.proposal ? g.proposal.id : "_loose";
@@ -10288,7 +10384,7 @@ export default function TakeoffCanvas() {
             style). Moved out of the toolbar so it never wraps a third row. The
             takeoffs toggle mirrors the DOCKED panel's collapsed pref — the rail
             rides the canvas edge, so it stays visible either way. */}
-        <div data-panel-rail style={{ position: "absolute", right: 14, top: "50%", transform: "translateY(-50%)", display: workspaceLayout && !focusMode ? "none" : "flex", flexDirection: "column", gap: 6, zIndex: 8 }}>
+        <div data-panel-rail style={{ position: "absolute", right: 14, top: "50%", transform: "translateY(-50%)", display: HELM_SIMPLE || (workspaceLayout && !focusMode) ? "none" : "flex", flexDirection: "column", gap: 6, zIndex: 8 }}>
           {panelBtn(() => setLeftTab((t) => (t === "markup" ? null : "markup")), "document", "Markup list — existing clouds, callouts, and notes", leftTab === "markup", markupCount)}
           {panelBtn(() => setLeftTab((t) => (t === "stamp" ? null : "stamp")), "stamp", "Stamps — reusable annotations dropped click-to-place", leftTab === "stamp", stampLib.stamps.length)}
           {panelBtn(() => setLeftTab((t) => (t === "rfi" ? null : "rfi")), "rfi", "RFI register — raise, track, and export Requests For Information", leftTab === "rfi", rfis.length)}
@@ -10334,7 +10430,7 @@ export default function TakeoffCanvas() {
           as "Export is unclickable". The row therefore SCROLLS itself; its
           menus open position:fixed off the trigger rect (ToolMenu) so this
           overflow cannot clip them. */}
-      {!focusMode && workspaceLayout && <WorkspaceChrome
+      {!focusMode && workspaceLayout && !HELM_SIMPLE && <WorkspaceChrome
         title={projectName || active} onOpen={HELM_EMBED ? undefined : () => fileInputRef.current?.click()}
         onNavigate={() => setWorkspaceNavigationOpen((v) => !v)} navigationOpen={workspaceNavigationOpen}
         onTakeoffs={toggleTakeoffs} takeoffsOpen={takeoffsOpen} onWork={() => setAgentOpen((v) => !v)} workOpen={agentOpen} workButtonRef={workButtonRef}
@@ -10367,9 +10463,9 @@ export default function TakeoffCanvas() {
         scaleMenu={<><button type="button" onClick={() => setUnits((u) => u === "metric" ? "imperial" : "metric")} title="Switch display units">{units === "metric" ? "m" : "ft"}</button><ToolMenu title={scaleTitle} onOpenChange={onScaleMenuDepth} face={<span data-tour="scale">{scaleFace}</span>} faceStyle={{ fontFamily: "var(--f-mono)", fontSize: 11.5, ...scaleFaceStyle }} menuStyle={{ minWidth: 250 }} items={scaleItems} /></>}
       />}
       {workspaceLayout && !workspaceArrangement.readout && selShape?.measure_role === "surface_area" && <div className="calm-property-editor"><label>Selected wall height <input aria-label="Selected wall height" type="number" min="0" step={heightStep(units)} value={shapeHDraft ?? dimInputStr(selShape.height_ft, units, "height")} onChange={(e) => { setShapeHDraft(e.target.value); setShapeHeight(e.target.value); }} onBlur={() => { if (shapeHDraft != null) setShapeHeight(shapeHDraft); setShapeHDraft(null); }} /></label><span>{heightUnit(units)} → {fa(selShape.computed?.area_sf || 0)}</span><button type="button" onClick={clearShapeHeight}>Use condition height</button></div>}
-      {!focusMode && workspaceLayout && workspaceDetailsOpen && aCond && <div className="calm-property-editor"><strong>{aCond.finish_tag}</strong><ConditionAppearanceEditor cond={aCond} onUpdateCond={updateCond} onSetCondParam={setCondParam} onAssignAttr={assignAttr} conditionColumns={conditionColumns} layout="row" units={units} /><button type="button" onClick={() => setWorkspaceDetailsOpen(false)}>Close properties</button></div>}
-      {workspaceLayout && <><WorkspaceCommandMenu open={workspaceSearchOpen} onClose={() => setWorkspaceSearchOpen(false)} actions={workspaceActions} onOpenChange={onMenuDepth} /><WorkspaceLayoutDialog open={workspaceLayoutOpen} onClose={() => setWorkspaceLayoutOpen(false)} prefs={workspacePrefs} onOpenChange={onMenuDepth} /></>}
-      {!focusMode && (!workspaceLayout || workspaceControlsOpen) && (
+      {!focusMode && workspaceLayout && !HELM_SIMPLE && workspaceDetailsOpen && aCond && <div className="calm-property-editor"><strong>{aCond.finish_tag}</strong><ConditionAppearanceEditor cond={aCond} onUpdateCond={updateCond} onSetCondParam={setCondParam} onAssignAttr={assignAttr} conditionColumns={conditionColumns} layout="row" units={units} /><button type="button" onClick={() => setWorkspaceDetailsOpen(false)}>Close properties</button></div>}
+      {workspaceLayout && !HELM_SIMPLE && <><WorkspaceCommandMenu open={workspaceSearchOpen} onClose={() => setWorkspaceSearchOpen(false)} actions={workspaceActions} onOpenChange={onMenuDepth} /><WorkspaceLayoutDialog open={workspaceLayoutOpen} onClose={() => setWorkspaceLayoutOpen(false)} prefs={workspacePrefs} onOpenChange={onMenuDepth} /></>}
+      {!focusMode && !HELM_SIMPLE && (!workspaceLayout || workspaceControlsOpen) && (
       <div data-topbar style={{ display: "flex", gap: 7, alignItems: "center", padding: "0 14px 6px", borderBottom: "1px solid var(--ink-faint)", background: "var(--paper-bright)", whiteSpace: "nowrap" }}>
         {/* The working controls scroll as one region when the window is
             narrower than the row (1440-class laptops); Report, ⋯, presence and
@@ -10601,7 +10697,7 @@ export default function TakeoffCanvas() {
           — the same one the docked panel row renders — so line/fill/hatch/height
           are editable without opening the sidebar. Shown once there's a
           condition to pin, so the drop zone is discoverable. */}
-      {!focusMode && (!workspaceLayout || workspaceArrangement.palette) && conditions.length > 0 && (
+      {!focusMode && !HELM_SIMPLE && (!workspaceLayout || workspaceArrangement.palette) && conditions.length > 0 && (
         <div
           onDragOver={(e) => { if (e.dataTransfer.types.includes(CONDITION_DND_MIME)) { e.preventDefault(); e.stopPropagation(); e.dataTransfer.dropEffect = "copy"; } }}
           onDrop={(e) => { if (!e.dataTransfer.types.includes(CONDITION_DND_MIME)) return; e.preventDefault(); e.stopPropagation(); const id = e.dataTransfer.getData(CONDITION_DND_MIME); if (id) pinToPalette(id); }}
@@ -10653,11 +10749,11 @@ export default function TakeoffCanvas() {
         </div>
       )}
 
-      {!focusMode && view === "canvas" && annotations.toolbar}
+      {!focusMode && !HELM_SIMPLE && view === "canvas" && annotations.toolbar}
 
       {/* open-sheet tabs — what you opened from the gallery; click to view,
           ⊞ to side-by-side, ✕ to close; the dropdown lists every open sheet */}
-      {!focusMode && openTabs.length > 0 && (
+      {(!focusMode || HELM_SIMPLE) && openTabs.length > 0 && (
         <div data-sheet-tabs style={{ display: "flex", gap: 5, alignItems: "center", padding: "5px 14px", flexWrap: openTabs.length > MANY_TABS ? "nowrap" : "wrap", borderBottom: "1px solid var(--ink-faint)", background: "var(--paper-bright)", minWidth: 0 }}>
           <span style={{ fontFamily: "var(--f-mono)", fontSize: 9.5, textTransform: "uppercase", letterSpacing: "0.14em", color: "var(--ink-muted)", flexShrink: 0 }}>Sheets</span>
           {openTabs.length > MANY_TABS && (
@@ -10681,7 +10777,7 @@ export default function TakeoffCanvas() {
                 title={!isStitchKey(k) ? "Drag this tab to a screen edge to split, or out of the app to export the marked sheet" : undefined}
                 style={{ display: "inline-flex", alignItems: "center", gap: 5, flexShrink: 0, border: "1px solid var(--ink-faint)", borderBottom: on ? "2px solid var(--cobalt)" : "1px solid var(--ink-faint)", background: on ? "var(--paper-cream)" : "transparent", padding: "3px 6px 2px 9px", maxWidth: 190 }}>
                 <button onClick={() => goToSheet(k)} title={k} style={{ border: "none", background: "none", cursor: "pointer", fontWeight: on ? 700 : 500, fontSize: 11.5, color: "var(--ink)", fontFamily: "var(--f-mono)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", maxWidth: 140, padding: 0 }}>{lbl}</button>
-                <button onClick={() => toggleInGroup(k)} title={inGroup ? "Remove from side-by-side" : "Side-by-side with the current sheet"} style={{ border: "none", background: "none", cursor: "pointer", color: inGroup ? "var(--cobalt)" : "var(--ink-faint)", padding: 0, display: "inline-flex" }}><Icon name="sideBySide" size={11} /></button>
+                {!HELM_SIMPLE && <button onClick={() => toggleInGroup(k)} title={inGroup ? "Remove from side-by-side" : "Side-by-side with the current sheet"} style={{ border: "none", background: "none", cursor: "pointer", color: inGroup ? "var(--cobalt)" : "var(--ink-faint)", padding: 0, display: "inline-flex" }}><Icon name="sideBySide" size={11} /></button>}
                 <button onClick={() => closeTab(k)} title="Close tab" style={{ border: "none", background: "none", cursor: "pointer", color: "var(--ink-muted)", padding: 0, display: "inline-flex" }}><Icon name="close" size={10} /></button>
               </span>
             );
@@ -10706,7 +10802,7 @@ export default function TakeoffCanvas() {
           the same state (activate/reassign, hotkey badges, + condition) for
           users who want max panel-collapse and one-click switching. Toggled
           from the panel header, persisted with the panel prefs. */}
-      {!focusMode && !workspaceLayout && panelPrefs.strip && (
+      {!focusMode && !HELM_SIMPLE && !workspaceLayout && panelPrefs.strip && (
         <div style={{ display: "flex", gap: 8, alignItems: "center", padding: "7px 14px", flexWrap: "wrap", borderBottom: "1px solid var(--ink-faint)", background: "var(--paper-bright)" }}>
           <span style={{ fontSize: 11, textTransform: "uppercase", letterSpacing: 0.4, color: "var(--ink-muted)" }}>Conditions</span>
           {conditions.map((c, i) => {
@@ -10789,13 +10885,13 @@ export default function TakeoffCanvas() {
 
       {/* canvas + issue desk */}
       <div data-canvas-workspace style={{ flex: 1, display: "flex", overflow: "hidden", minHeight: 0, position: "relative" /* anchors the narrow-screen panel overlay */ }}>
-       {workspaceLayout && <><WorkspaceNavigator open={!focusMode && workspaceNavigationOpen} items={workspaceSheets} current={treeCurrent} namer={namer} countKnown={countKnown} hold={ocrHold} onSelect={(key) => openSheets([key], false)} onClose={() => setWorkspaceNavigationOpen(false)} onGallery={() => { setView("gallery"); setWorkspaceNavigationOpen(false); }} dockSide={workspaceArrangement.sheets} width={workspaceArrangement.sheetWidth} dockHandle={workspaceDockHandle("sheets", "Sheets")} /><DockTargets dragging={workspaceDragging} /></>}
+       {workspaceLayout && <><WorkspaceNavigator open={!focusMode && !HELM_SIMPLE && workspaceNavigationOpen} items={workspaceSheets} current={treeCurrent} namer={namer} countKnown={countKnown} hold={ocrHold} onSelect={(key) => openSheets([key], false)} onClose={() => setWorkspaceNavigationOpen(false)} onGallery={() => { setView("gallery"); setWorkspaceNavigationOpen(false); }} dockSide={workspaceArrangement.sheets} width={workspaceArrangement.sheetWidth} dockHandle={workspaceDockHandle("sheets", "Sheets")} /><DockTargets dragging={workspaceDragging} /></>}
        {/* tool rail — machined faces grouped by MCP module (the concept shell).
            Individual tiles replace deck 2's Measure/Cut Out menus; Markup keeps
            its variety flyout on one tile (five markup kinds don't earn five
            faces). Lives in the canvas row so docked panels + canvas reflow
            beside it; survives focus mode — it IS the tool access. */}
-       {view === "canvas" && (
+       {view === "canvas" && !HELM_SIMPLE && (
        <nav data-tool-rail data-dock-side={workspaceLayout ? workspaceArrangement.tools : undefined} role="toolbar" aria-label="Tools" style={{ order: workspaceLayout ? workspaceArrangement.tools === "right" ? 30 : -30 : undefined, width: "var(--rail-w)", flexShrink: 0, display: "flex", flexDirection: "column", alignItems: "center", gap: "var(--sp-1)", paddingTop: "var(--sp-2)", borderRight: "1px solid var(--ink-faint)", background: "var(--paper-bright)", overflowY: "auto", overflowX: "visible" }}>
          {workspaceDockHandle("tools", "Tools")}
          {railLabel("SEL")}
@@ -11221,7 +11317,7 @@ export default function TakeoffCanvas() {
             Takeoffs panel). Honest empty state until the BYO-AI seam is
             configured; otherwise the goal box, the streaming run log, and the
             per-proposal accept/reject desk. */}
-          <WorkspacePanel dockSide={workspaceLayout ? workspaceArrangement.work : undefined} width={workspaceLayout ? workspaceArrangement.workWidth : undefined} dockHandle={workspaceDockHandle("work", "Work")} open={agentOpen} shapes={shapes} conditions={condById} selectedId={selectedId}
+          <WorkspacePanel dockSide={workspaceLayout ? workspaceArrangement.work : undefined} width={workspaceLayout ? workspaceArrangement.workWidth : undefined} dockHandle={workspaceDockHandle("work", "Work")} open={agentOpen && !HELM_SIMPLE} shapes={shapes} conditions={condById} selectedId={selectedId}
             sheetLabel={tabLabel} fmtArea={(sf) => fa(sf, 2)} fmtLength={(lf) => fl(lf, 2)}
             scales={scales} scaleUnconfirmed={scaleUnconfirmed} running={agentRunning}
             proposalCount={agentProposals.length} onLocate={locateWork}
@@ -11289,7 +11385,7 @@ export default function TakeoffCanvas() {
             jarring jump. */}
         <TakeoffsPanel
           dockSide={workspaceLayout ? workspaceArrangement.takeoffs : undefined} layoutLocked={workspaceLayout && workspaceArrangement.locked} dockHandle={workspaceDockHandle("takeoffs", "Takeoffs")}
-          open={takeoffsOpen}
+          open={takeoffsOpen && !HELM_SIMPLE}
           width={panelW}
           overlay={isNarrow}
           multiSheet={groupKeys.length > 1}
@@ -11519,10 +11615,11 @@ export default function TakeoffCanvas() {
       })()}
       <footer className="ink-panel ticks"
         style={{ height: "var(--status-h)", flex: "0 0 auto", display: "flex", alignItems: "center", gap: 12, padding: "0 14px", fontFamily: "var(--f-mono)", fontSize: "var(--fs-xs)", fontVariantNumeric: "tabular-nums", whiteSpace: "nowrap", overflow: "hidden", userSelect: "none" }}>
-        <span style={{ color: "var(--status-acc)", textShadow: "var(--glow)" }}>{TOOL_VERB[tool] || tool}</span>
-        <span style={{ opacity: 0.25 }} aria-hidden="true">|</span>
-        <span ref={statusCoordRef} aria-hidden="true" style={{ minWidth: 150 }} />
-        <span style={{ opacity: 0.25 }} aria-hidden="true">|</span>
+        {/* Simple mode: Helm OS's toolbar says the tool; the verb and the cursor coordinates are instrument talk. */}
+        <span style={{ color: "var(--status-acc)", textShadow: "var(--glow)", display: HELM_SIMPLE ? "none" : undefined }}>{TOOL_VERB[tool] || tool}</span>
+        <span style={{ opacity: 0.25, display: HELM_SIMPLE ? "none" : undefined }} aria-hidden="true">|</span>
+        <span ref={statusCoordRef} aria-hidden="true" style={{ minWidth: 150, display: HELM_SIMPLE ? "none" : undefined }} />
+        <span style={{ opacity: 0.25, display: HELM_SIMPLE ? "none" : undefined }} aria-hidden="true">|</span>
         <span>{scaleFace}</span>
         {commitMsg && (
           <span title={commitMsg} style={{ marginLeft: 8, color: isDangerMsg(commitMsg) ? "var(--c-danger)" : "var(--c-positive)", overflow: "hidden", textOverflow: "ellipsis", minWidth: 0 }}>
@@ -11538,7 +11635,7 @@ export default function TakeoffCanvas() {
             <button type="button" className="btn-ghost" onClick={cancelImportRead} style={{ padding: "var(--sp-1) var(--sp-2)" }}>Cancel</button>
           </>)}
         </span>
-        <span style={{ marginLeft: "auto", display: "flex", gap: 12, opacity: 0.75 }} aria-live="polite">
+        <span style={{ marginLeft: "auto", display: HELM_SIMPLE ? "none" : "flex", gap: 12, opacity: 0.75 }} aria-live="polite">
           <span>{shapes.filter((s) => panelKeySet.has(s.sheet_id)).length} shapes</span>
           <span>{cloudMode ? "drive" : "local"}{saveState === "saving" ? " · saving…" : saveState === "saved" ? " · saved" : ""}</span>
         </span>
@@ -11548,12 +11645,12 @@ export default function TakeoffCanvas() {
           re-reads immediately). */}
       {showAiSettings && <AiSettings onClose={() => setShowAiSettings(false)} />}
       {/* live counter (mock) — floating running totals, drag to park anywhere */}
-      {!focusMode && (!workspaceLayout || workspaceArrangement.counter) && !agentOpen && !showReport && <LiveCounter rows={liveCounterRows} onActivate={(id) => activateCondition(id, { reassign: false })} />}
+      {!focusMode && !HELM_SIMPLE && (!workspaceLayout || workspaceArrangement.counter) && !agentOpen && !showReport && <LiveCounter rows={liveCounterRows} onActivate={(id) => activateCondition(id, { reassign: false })} />}
       {/* the manual, last in the tree so it sits above every panel and dock */}
       {guideOpen && <UserGuide onClose={() => setGuideOpen(false)} onTour={startTour} onConnect={() => { setGuideOpen(false); setConnectOpen(true); }} />}
       {connectOpen && <ConnectAI onClose={() => setConnectOpen(false)} />}
       {companySetupOpen && <CompanySetup onClose={() => setCompanySetupOpen(false)} onSaved={() => setCompanyRev((r) => r + 1)} />}
-      {tour && view === "canvas" && !focusMode && !guideOpen && !connectOpen && (
+      {tour && !HELM_SIMPLE && view === "canvas" && !focusMode && !guideOpen && !connectOpen && (
         <FirstTakeoffTour done={tour.done} step={currentStep(tour.done)} sheetOpen={tourSheetOpen}
           sampleBusy={tourSampleBusy} onLoadSample={loadSampleForTour} result={tourResult}
           onClose={() => setTour(null)} onConnect={() => { setTour(null); setConnectOpen(true); }} />
